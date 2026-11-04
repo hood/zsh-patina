@@ -1569,8 +1569,18 @@ fn start_daemon_internal(
                 // case something goes wrong during communication (e.g. the
                 // client sends a higher line count in the header than it
                 // actually sends lines), we won't block indefinitely.
-                stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+                //
+                // Never use `?` here. On macOS, setsockopt fails with EINVAL if
+                // the client has already closed the connection, and returning
+                // an error would terminate the whole daemon. Just drop the
+                // connection instead.
+                if let Err(e) = stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(1))))
+                {
+                    log::debug!("Dropping connection: {e}");
+                    continue;
+                }
 
                 let highlighter = Arc::clone(&highlighter);
                 pool.spawn(|| {
