@@ -299,16 +299,23 @@ _zsh_patina() {
     # Count lines in pre-buffer. In a multi-line input at the secondary prompt,
     # the pre-buffer contains the lines before the one the cursor is currently
     # in.
+    #
+    # Performance: split into an array instead of removing every character
+    # except '\n' with `${var//[^$'\n']/}`. The latter is quadratic and takes
+    # ~100ms for 20k characters. Quoted `(@f)` keeps empty lines, so the number
+    # of elements is always the number of newlines + 1.
+    local -a lines_tmp
     local pre_count=0
     if [[ -n "$trimmed_prebuffer" ]]; then
-        # remove every character instead of '\n' and then get string length
-        pre_count=$(( ${#${trimmed_prebuffer//[^$'\n']/}} + 1 ))
+        lines_tmp=("${(@f)trimmed_prebuffer}")
+        pre_count=${#lines_tmp}
     fi
 
     # Count lines in buffer
     local count=0
     if [[ -n "$BUFFER" ]]; then
-        count=$(( ${#${BUFFER//[^$'\n']/}} + 1 ))
+        lines_tmp=("${(@f)BUFFER}")
+        count=${#lines_tmp}
     fi
 
     # Performance: no `2>/dev/null` here. Any redirection on a builtin costs
