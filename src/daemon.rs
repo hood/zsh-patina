@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     borrow::Cow,
     fs::{self, File, OpenOptions, Permissions, TryLockError},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write, stdout},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write, stdout},
     os::{
         fd::AsRawFd,
         unix::{
@@ -81,6 +81,18 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 // Polling interval used while waiting for the daemon to finish initialization.
 const LOCK_WAIT_INTERVAL: Duration = Duration::from_millis(50);
+
+// Highlighted once in the background when the daemon starts. Syntect compiles
+// regexes lazily, so this should touch as many syntax contexts as possible.
+// Otherwise, the first keystrokes using a new construct (quotes, expansions,
+// loops, etc.) pay for the compilation (up to ~1.5ms each instead of ~0.2ms).
+const WARMUP_COMMAND: &str = concat!(
+    "sudo -E git commit -m \"msg $HOME ${x:-y} $(date +%s)\" --amend 2>&1 ",
+    "| grep -v 'x' >> /tmp/f && cd ~/src || ls -la *.txt\n",
+    "for f in a b; do if [[ -f $f && $((1+2)) -gt 0 ]]; then ",
+    "echo `pwd` $'\\n' !! !$; fi; done; case $x in a) : ;; esac; ",
+    "foo() { local v=(1 2); export X=1 }; cat <<EOF\nhi\nEOF",
+);
 
 fn read_pid(pid_file: &mut File) -> Result<u32> {
     let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
@@ -214,6 +226,11 @@ fn handle_connection(stream: UnixStream, highlighter: Arc<Highlighter>) -> Resul
         .context("Unable to clone socket for writing")?;
     let mut reader = BufReader::new(stream);
 
+    // Performance: buffer the response so it is sent with as few syscalls as
+    // possible instead of one per span. Queries flush explicitly before they
+    // wait for an answer.
+    let mut writer = BufWriter::new(writer);
+
     // read protocol version (or header if protocol is v1)
     let mut first_line = String::new();
     reader
@@ -224,10 +241,10 @@ fn handle_connection(stream: UnixStream, highlighter: Arc<Highlighter>) -> Resul
     }
 
     let version = first_line.strip_prefix("VER=").unwrap_or("1");
-    match version {
-        "3" => handle_connection_v3(reader, writer, &highlighter),
-        "2" => handle_connection_v2(reader, writer, &highlighter),
-        "1" => handle_connection_v1(reader, writer, first_line, highlighter),
+    let result = match version {
+        "3" => handle_connection_v3(reader, &mut writer, &highlighter),
+        "2" => handle_connection_v2(reader, &mut writer, &highlighter),
+        "1" => handle_connection_v1(reader, &mut writer, first_line, highlighter),
         _ => {
             // Return immediately. This will close the connection with an empty
             // response.
@@ -237,7 +254,10 @@ fn handle_connection(stream: UnixStream, highlighter: Arc<Highlighter>) -> Resul
             );
             Ok(())
         }
-    }
+    };
+    result?;
+
+    writer.flush().context("Unable to send response")
 }
 
 #[deprecated(
@@ -1525,10 +1545,7 @@ fn start_daemon_internal(
     // background task to not delay the main thread
     let init_highlighter = Arc::clone(&highlighter);
     pool.spawn(move || {
-        let _ = init_highlighter.highlight(
-            "echo Welcome to zsh-patina!",
-            &HighlightingRequest::default(),
-        );
+        let _ = init_highlighter.highlight(WARMUP_COMMAND, &HighlightingRequest::default());
     });
 
     // bind the Unix domain socket
